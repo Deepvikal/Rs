@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flow Visualiser by RS</title>
+<style>
+:root{--ink:#172536;--muted:#5c6c7e;--border:#d8e2ec;--blue:#1769aa;--orange:#e87528;--green:#16866b}
+*{box-sizing:border-box}body{margin:0;background:#f1f5f8;color:var(--ink);font-family:Segoe UI,Arial,sans-serif}
+.wrap{max-width:1220px;margin:auto;padding:22px}h1{margin:0 0 7px;font-size:clamp(1.55rem,3vw,2.2rem)}.intro{margin:0 0 18px;color:var(--muted);line-height:1.5}
+.layout{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(280px,.8fr);gap:18px;align-items:start}.card{background:white;border:1px solid var(--border);border-radius:15px;padding:15px;box-shadow:0 4px 16px #20344a0b}
+canvas{width:100%;height:auto;display:block;border-radius:10px;border:1px solid #d6e3eb;background:#eaf5f8}
+.legend{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0 0;font-size:.88rem;color:var(--muted)}.key{display:flex;align-items:center;gap:6px}.swatch{width:22px;height:4px;border-radius:4px}
+h2{font-size:1.05rem;margin:0 0 12px}.control{margin:14px 0}.control label{display:flex;justify-content:space-between;gap:10px;font-weight:650;font-size:.92rem;margin-bottom:7px}.control output{color:var(--blue);font-variant-numeric:tabular-nums}select,input[type=range]{width:100%}select{padding:10px;border:1px solid var(--border);border-radius:9px;background:white;font-size:.95rem}input[type=range]{accent-color:var(--blue)}
+.buttons{display:flex;gap:8px;flex-wrap:wrap;margin-top:17px}button{border:1px solid var(--border);border-radius:9px;padding:10px 13px;background:#fff;color:var(--ink);font-weight:700;cursor:pointer;min-height:42px}button.primary{background:var(--blue);color:white;border-color:var(--blue)}button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid #8bc8f5;outline-offset:2px}
+.definition{padding:11px 0;border-top:1px solid var(--border);line-height:1.48}.definition:first-of-type{border-top:0;padding-top:0}.definition strong{display:block;margin-bottom:3px}.small{font-size:.87rem;line-height:1.5;color:var(--muted)}.notice{background:#eef6fb;padding:11px;border-radius:9px;font-size:.88rem;line-height:1.5;color:#2c526d;margin-top:12px}
+@media(max-width:820px){.wrap{padding:12px}.layout{grid-template-columns:1fr}.card{padding:12px}}
+</style>
+</head>
+<body><main class="wrap">
+<header><h1>Flow Visualiser by RS</h1></header>
+<div class="layout">
+<section class="card">
+<canvas id="scene" width="900" height="560" role="img" aria-label="Animated river with velocity vectors and one selected fluid-flow curve."></canvas>
+<div class="buttons"><button class="primary" id="toggle">Pause motion</button><button id="reset">Reset</button></div>
+<p class="small" id="caption" aria-live="polite"></p>
+</section>
+<aside class="card">
+<h2>Visualization controls</h2>
+<div class="control"><label for="mode">Show one concept</label><select id="mode">
+<option value="streamline">Streamline</option>
+<option value="streakline">Streakline</option>
+<option value="pathline" selected>Pathline (single particle)</option>
+<option value="pathlines">Pathlines (multiple particles)</option>
+</select></div>
+<div class="control"><label for="flow">Flow conditions</label><select id="flow"><option value="steady">Steady river flow</option><option value="unsteady" selected>Unsteady river flow</option></select></div>
+
+
+
+
+</aside></div></main>
+<script>
+(() => {
+'use strict';
+const canvas=document.getElementById('scene'),ctx=canvas.getContext('2d');
+const $=id=>document.getElementById(id);
+const W=canvas.width,H=canvas.height;
+const domain={xmin:0,xmax:10,ymin:0,ymax:6.2};
+const injection={x:1.1,y:3.1};
+let running=true,lastFrame=0,clock=0,raf=0,tracked=null,multiTracked=null;
+const px=x=>42+(x-domain.xmin)/(domain.xmax-domain.xmin)*(W-76);
+const py=y=>H-35-(y-domain.ymin)/(domain.ymax-domain.ymin)*(H-68);
+const settings=()=>({mode:$('mode').value,steady:$('flow').value==='steady',duration:10,U:1,A:0.8,density:4});
+const centerY=x=>3.1+0.72*Math.sin((x-0.5)*0.62)+0.12*Math.sin(x*1.4);
+const halfWidth=x=>1.75+0.12*Math.sin(x*0.8);
+function inRiver(p){return p.x>=0&&p.x<=10&&Math.abs(p.y-centerY(p.x))<halfWidth(p.x);}
+function velocity(x,y,t,s){
+  const cy=centerY(x), eta=(y-cy)/halfWidth(x);
+  const profile=Math.max(0.12,1-0.58*eta*eta);
+  const wave=s.steady?0:s.A*Math.sin(1.15*t-0.62*x);
+  // Main flow is downstream (+x); the lateral component follows the curved river
+  // and varies in time only in the unsteady case.
+  const u=s.U*profile*(1+(s.steady?0:0.16*Math.sin(1.15*t-0.5*x)));
+  const v=s.U*(0.45*Math.cos((x-0.5)*0.62)+wave)*0.36;
+  return {u,v};
+}
+function step(pos,t,dt,s){
+  const a=velocity(pos.x,pos.y,t,s),mid={x:pos.x+a.u*dt/2,y:pos.y+a.v*dt/2};
+  const b=velocity(mid.x,mid.y,t+dt/2,s);
+  return {x:pos.x+b.u*dt,y:pos.y+b.v*dt};
+}
+function integrateFrom(pos,t0,t1,s,dt=0.025){
+  let p={...pos},pts=[{...p}],n=Math.min(1400,Math.ceil(Math.max(0,t1-t0)/dt));
+  if(n===0)return pts;const h=(t1-t0)/n;
+  for(let i=0;i<n;i++){p=step(p,t0+i*h,h,s);if(!inRiver(p))break;pts.push({...p});}
+  return pts;
+}
+function line(points,color,width=2.8,alpha=1){
+ if(points.length<2)return;ctx.save();ctx.globalAlpha=alpha;ctx.strokeStyle=color;ctx.lineWidth=width;ctx.lineCap='round';ctx.lineJoin='round';ctx.beginPath();
+ points.forEach((p,i)=>i?ctx.lineTo(px(p.x),py(p.y)):ctx.moveTo(px(p.x),py(p.y)));ctx.stroke();ctx.restore();
+}
+function arrow(x,y,u,v,color='#f6fbff',scale=0.15){
+ const x1=px(x),y1=py(y),x2=px(x+u*scale),y2=py(y+v*scale),dx=x2-x1,dy=y2-y1,L=Math.hypot(dx,dy);if(L<1)return;
+ const ux=dx/L,uy=dy/L,h=5.5;ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=1.15;
+ ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();ctx.beginPath();ctx.moveTo(x2,y2);ctx.lineTo(x2-h*ux+h*.5*uy,y2-h*uy-h*.5*ux);ctx.lineTo(x2-h*ux-h*.5*uy,y2-h*uy+h*.5*ux);ctx.closePath();ctx.fill();
+}
+function drawRiver(){
+ ctx.clearRect(0,0,W,H);ctx.fillStyle='#e8f1dc';ctx.fillRect(0,0,W,H);
+ // Soft land texture
+ for(let i=0;i<90;i++){const x=(i*97%W),y=(i*67%H);ctx.fillStyle=i%2?'#dbe8d0':'#edf2df';ctx.beginPath();ctx.ellipse(x,y,10,3,(i%7)*.3,0,Math.PI*2);ctx.fill();}
+ const upper=[],lower=[];
+ for(let i=0;i<=200;i++){const x=10*i/200,cy=centerY(x),w=halfWidth(x);upper.push({x,y:cy+w});lower.push({x,y:cy-w});}
+ ctx.beginPath();upper.forEach((p,i)=>i?ctx.lineTo(px(p.x),py(p.y)):ctx.moveTo(px(p.x),py(p.y)));[...lower].reverse().forEach(p=>ctx.lineTo(px(p.x),py(p.y)));ctx.closePath();
+ const water=ctx.createLinearGradient(0,0,W,H);water.addColorStop(0,'#78c9df');water.addColorStop(.5,'#399fc5');water.addColorStop(1,'#65bdd4');ctx.fillStyle=water;ctx.fill();
+ // River banks
+ ctx.strokeStyle='#b59a6b';ctx.lineWidth=13;ctx.lineJoin='round';ctx.beginPath();upper.forEach((p,i)=>i?ctx.lineTo(px(p.x),py(p.y)):ctx.moveTo(px(p.x),py(p.y)));ctx.stroke();ctx.beginPath();lower.forEach((p,i)=>i?ctx.lineTo(px(p.x),py(p.y)):ctx.moveTo(px(p.x),py(p.y)));ctx.stroke();
+ ctx.strokeStyle='#e6d3a6';ctx.lineWidth=5;ctx.beginPath();upper.forEach((p,i)=>i?ctx.lineTo(px(p.x),py(p.y)):ctx.moveTo(px(p.x),py(p.y)));ctx.stroke();ctx.beginPath();lower.forEach((p,i)=>i?ctx.lineTo(px(p.x),py(p.y)):ctx.moveTo(px(p.x),py(p.y)));ctx.stroke();
+ // subtle water ripples, clipped to river
+ ctx.save();ctx.beginPath();upper.forEach((p,i)=>i?ctx.lineTo(px(p.x),py(p.y)):ctx.moveTo(px(p.x),py(p.y)));[...lower].reverse().forEach(p=>ctx.lineTo(px(p.x),py(p.y)));ctx.closePath();ctx.clip();
+ ctx.strokeStyle='#b8e8f0';ctx.lineWidth=1.2;
+ for(let i=0;i<18;i++){const x=0.4+(i*0.53)%9.2,y=centerY(x)+(i%5-2)*.23;ctx.beginPath();ctx.moveTo(px(x),py(y));ctx.quadraticCurveTo(px(x+.18),py(y-.04),px(x+.38),py(y));ctx.stroke();}
+ ctx.restore();
+ // Labels and fixed dye marker
+ ctx.fillStyle='#35584a';ctx.font='bold 13px Segoe UI,Arial';ctx.fillText('RIVER BANK',px(7.9),py(centerY(7.9)+halfWidth(7.9)+.48));
+ ctx.fillStyle='#fff';ctx.strokeStyle='#22516a';ctx.lineWidth=2;ctx.beginPath();ctx.arc(px(injection.x),py(injection.y),6,0,Math.PI*2);ctx.fill();ctx.stroke();
+ ctx.fillStyle='#15384d';ctx.font='12px Segoe UI,Arial';ctx.fillText('Dye injection point',px(injection.x)+11,py(injection.y)-12);
+}
+function drawVectors(s,t){
+ const spacing={1:.75,2:.52,3:.36,4:.25}[s.density];
+ for(let x=.25;x<9.8;x+=spacing){
+  for(let y=centerY(x)-halfWidth(x)+.18;y<centerY(x)+halfWidth(x)-.1;y+=spacing){
+   if(!inRiver({x,y}))continue;const v=velocity(x,y,t,s);arrow(x,y,v.u,v.v,'rgba(255,255,255,.92)',0.18);
+  }
+ }
+}
+function calcStreamlines(s,t){
+ // A family of instantaneous streamlines seeded across the river cross-section.
+ const lines=[], x0=1.15, cy=centerY(x0), w=halfWidth(x0);
+ for(let k=-5;k<=5;k++){
+  const seed={x:x0,y:cy+k*w*0.145};
+  if(!inRiver(seed))continue;
+  const trace=(sign)=>{
+   let p={...seed},pts=[{...p}],ds=sign*0.035;
+   for(let i=0;i<1000;i++){
+    const v=velocity(p.x,p.y,t,s),m=Math.hypot(v.u,v.v)||1;
+    p={x:p.x+v.u/m*ds,y:p.y+v.v/m*ds};
+    if(!inRiver(p))break;pts.push({...p});
+   }
+   return sign<0?pts.reverse():pts;
+  };
+  const back=trace(-1),forward=trace(1);lines.push(back.slice(0,-1).concat(forward));
+ }
+ return lines;
+}
+function calcStreaklines(s,tNow){
+ // Each streakline is the current locus of particles released from one fixed
+ // source. A particle is removed immediately if its trajectory crosses a bank.
+ const all=[],start=Math.max(0,tNow-s.duration),count=Math.max(2,Math.round((tNow-start)*5)+1);
+ for(let k=-3;k<=3;k++){
+  const source={x:1.1,y:centerY(1.1)+k*0.34};
+  if(!inRiver(source))continue;
+  let segment=[];
+  for(let i=0;i<count;i++){
+   const release=start+(tNow-start)*i/(count-1);
+   let p={...source},alive=true;
+   const n=Math.ceil(Math.max(0,tNow-release)/0.06),h=n?(tNow-release)/n:0;
+   for(let j=0;j<n;j++){
+    const next=step(p,release+j*h,h,s);
+    if(!inRiver(next)){alive=false;break;}
+    p=next;
+   }
+   if(alive){segment.push(p);}
+   else if(segment.length>1){all.push(segment);segment=[];}else{segment=[];}
+  }
+  if(segment.length>1)all.push(segment);
+ }
+ return all;
+}
+function initMultiplePathlines(s){
+ // Give each particle its own persistent position and time-stamped trajectory.
+ multiTracked=Array.from({length:9},(_,i)=>{
+  const pos={x:0.55,y:centerY(0.55)+(i-4)*0.27};
+  return {pos,history:[{...pos,t:clock}],active:inRiver(pos)};
+ });
+}
+function updateMultiplePathlines(s,old,dt){
+ if(!multiTracked)initMultiplePathlines(s);
+ const cutoff=clock-s.duration;
+ for(const particle of multiTracked){
+  if(particle.active){
+   const next=step(particle.pos,old,dt,s);
+   if(inRiver(next)){
+    particle.pos=next;
+    particle.history.push({...next,t:clock});
+   }else{
+    // The particle vanishes at the bank; its already-traced path remains visible.
+    particle.active=false;
+   }
+  }
+  while(particle.history.length>2&&particle.history[1].t<cutoff)particle.history.shift();
+ }
+}
+function ensureTracked(s){
+ if(!tracked){tracked={start:Math.max(0,clock-s.duration),pos:{x:1.45,y:centerY(1.45)},history:[]};}
+ // Track only the selected time window, keeping the initial particle at its initial position.
+ if(!tracked.history.length)tracked.history=[{x:tracked.pos.x,y:tracked.pos.y,t:clock}];
+}
+function update(s,dt){
+ const old=clock;clock+=dt;
+ if(s.mode==='pathlines'){
+  updateMultiplePathlines(s,old,dt);
+  return;
+ }
+ if(s.mode==='pathline'){
+  if(!tracked)ensureTracked(s);
+  const next=step(tracked.pos,old,dt,s);
+  if(inRiver(next)){
+   tracked.pos=next;
+   tracked.history.push({x:next.x,y:next.y,t:clock});
+  }else{
+   tracked={pos:{x:1.45,y:centerY(1.45)},history:[{x:1.45,y:centerY(1.45),t:clock}]};
+  }
+  const cutoff=clock-s.duration;
+  while(tracked.history.length>2&&tracked.history[1].t<cutoff)tracked.history.shift();
+ }
+}
+function draw(){
+ const s=settings(),t=s.steady?0:clock;
+ drawRiver();drawVectors(s,t);
+ if(s.mode==='streamline'){
+  calcStreamlines(s,t).forEach((pts,i)=>line(pts,'#1769aa',2.5));
+  $('caption').textContent='';
+ }else if(s.mode==='streakline'){
+  const groups=calcStreaklines(s,clock);
+  groups.forEach(pts=>{line(pts,'#e87528',2.7);pts.forEach(p=>{ctx.fillStyle='#fff5ec';ctx.strokeStyle='#b94c0b';ctx.lineWidth=1.2;ctx.beginPath();ctx.arc(px(p.x),py(p.y),2.8,0,Math.PI*2);ctx.fill();ctx.stroke();});});
+  $('caption').textContent='';
+ }else if(s.mode==='pathlines'){
+  if(!multiTracked)initMultiplePathlines(s);
+  for(const particle of multiTracked){
+   const hist=particle.history.filter(p=>p.t>=clock-s.duration-1e-6);
+   line(hist,'#16866b',2.6);
+   if(particle.active){ctx.fillStyle='#fff';ctx.strokeStyle='#08664f';ctx.lineWidth=2;ctx.beginPath();ctx.arc(px(particle.pos.x),py(particle.pos.y),4.2,0,Math.PI*2);ctx.fill();ctx.stroke();}
+  }
+  $('caption').textContent='';
+ }else{
+  ensureTracked(s);
+  const hist=tracked.history.filter(p=>p.t>=clock-s.duration-1e-6);
+  line(hist,'#16866b',3.5);
+  const p=tracked.pos;ctx.fillStyle='#fff';ctx.strokeStyle='#08664f';ctx.lineWidth=2.5;ctx.beginPath();ctx.arc(px(p.x),py(p.y),5.5,0,Math.PI*2);ctx.fill();ctx.stroke();
+  $('caption').textContent='';
+ }
+ ctx.fillStyle='#153047';ctx.font='bold 13px Segoe UI,Arial';ctx.fillText(s.steady?'STEADY FLOW':'UNSTEADY FLOW',16,23);
+ ctx.font='12px Segoe UI,Arial';ctx.fillText('Observation time: '+clock.toFixed(1)+' s',16,42);
+}
+function syncOutputs(){
+ tracked=null;multiTracked=null;
+ draw();
+}
+function animate(now){
+ if(!lastFrame)lastFrame=now;const dt=Math.min((now-lastFrame)/1000,.04);lastFrame=now;
+ if(running)update(settings(),dt);
+ draw();raf=requestAnimationFrame(animate);
+}
+[$('mode'),$('flow')].forEach(el=>el.addEventListener('input',syncOutputs));
+$('toggle').addEventListener('click',()=>{running=!running;$('toggle').textContent=running?'Pause motion':'Resume motion';if(running)lastFrame=0;});
+$('reset').addEventListener('click',()=>{clock=0;tracked=null;multiTracked=null;lastFrame=0;draw();});
+draw();raf=requestAnimationFrame(animate);
+window.addEventListener('beforeunload',()=>cancelAnimationFrame(raf));
+})();
+</script></body></html>
